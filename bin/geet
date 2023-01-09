@@ -1,0 +1,134 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'simple_scripting/configuration'
+require_relative '../lib/geet/commandline/configuration'
+require_relative '../lib/geet/commandline/commands'
+require_relative '../lib/geet/commandline/editor'
+require_relative '../lib/geet/git/repository'
+require_relative '../lib/geet/helpers/summary_helper'
+require_relative '../lib/geet/shared/selection'
+require_relative '../lib/geet/utils/git_client'
+Dir[File.join(__dir__, '../lib/geet/services/*.rb')].each { |filename| require filename }
+
+class GeetLauncher
+  include Geet
+  include Geet::Commandline::Commands
+  include Geet::Helpers::SummaryHelper
+
+  SUMMARY_TEMPLATE = IO.read(File.expand_path('../lib/geet/resources/templates/edit_summary.md', __dir__))
+  SUMMARY_BACKUP = File.join(Dir.tmpdir, 'last_geet_edited_summary.md')
+
+  def launch
+    command, options = Commandline::Configuration.new.decode_argv || exit
+
+    repository = Git::Repository.new(upstream: !!options[:upstream], protected_repositories: protected_repositories)
+
+    case command
+    when GIST_CREATE_COMMAND
+      filename = options.delete(:filename)
+      options[:publik] = options.delete(:public) if options.key?(:public)
+
+      Services::CreateGist.new.execute(filename, **options)
+    when ISSUE_CREATE_COMMAND
+      summary = options[:summary] || Commandline::Editor.new.edit_content(help: SUMMARY_TEMPLATE)
+      title, description = split_summary(summary)
+
+      options = default_to_manual_selection(options, :labels, :milestone, :assignees)
+
+      Services::CreateIssue.new(repository).execute(title, description, **options)
+    when LABEL_CREATE_COMMAND
+      name = options.delete(:name)
+
+      Services::CreateLabel.new(repository).execute(name, **options)
+    when ISSUE_LIST_COMMAND
+      options = default_to_manual_selection(options, :assignee)
+
+      Services::ListIssues.new(repository).execute(**options)
+    when LABEL_LIST_COMMAND
+      Services::ListLabels.new(repository).execute
+    when MILESTONE_CLOSE_COMMAND
+      # Don't support user selection. This requires extra complexity, specifically, matching by number
+      # while displaying the titles (see AttributesSelectionManager).
+      #
+      options = {numbers: Shared::Selection::MANUAL_LIST_SELECTION_FLAG}
+
+      Services::CloseMilestones.new(repository).execute(**options)
+    when MILESTONE_CREATE_COMMAND
+      title = options.delete(:title)
+
+      Services::CreateMilestone.new(repository).execute(title)
+    when MILESTONE_LIST_COMMAND
+      Services::ListMilestones.new(repository).execute
+    when PR_COMMENT_COMMAND
+      comment = options.delete(:comment)
+
+      Services::CommentPr.new(repository).execute(comment, **options)
+    when PR_CREATE_COMMAND
+      summary = options[:summary] || edit_pr_summary(base: options[:base])
+      title, description = split_summary(summary)
+
+      options = default_to_manual_selection(options, :labels, :milestone, :reviewers)
+
+      Services::CreatePr.new(repository).execute(title, description, **options)
+
+      File.delete(SUMMARY_BACKUP)
+    when PR_LIST_COMMAND
+      Services::ListPrs.new(repository).execute
+    when PR_MERGE_COMMAND
+      Services::MergePr.new(repository).execute(**options)
+    when PR_OPEN_COMMAND
+      Services::OpenPr.new(repository).execute(**options)
+    when REPO_ADD_UPSTREAM_COMMAND
+      Services::AddUpstreamRepo.new(repository).execute
+    when REPO_OPEN_COMMAND
+      Services::OpenRepo.new(repository).execute(**options)
+    else
+      raise "Internal error - Unrecognized command #{command.inspect}"
+    end
+  end
+
+  private
+
+  def edit_pr_summary(base: nil)
+    # Tricky. It would be best to have Git logic exlusively inside the services,
+    # but at the same time, the summary editing should be out.
+    git = Utils::GitClient.new
+    pr_commits = git.cherry(base: base)
+
+    cancel_pr_help = "In order to cancel the PR creation, delete the description above.\n"
+
+    summary =
+      if File.exists?(SUMMARY_BACKUP)
+        prepopulated_summary = IO.read(SUMMARY_BACKUP)
+
+        Commandline::Editor.new.edit_content(content: prepopulated_summary, help: SUMMARY_TEMPLATE + cancel_pr_help)
+      elsif pr_commits.size == 1
+        prepopulated_summary = git.show_description('HEAD')
+
+        Commandline::Editor.new.edit_content(content: prepopulated_summary, help: SUMMARY_TEMPLATE + cancel_pr_help)
+      else
+        Commandline::Editor.new.edit_content(help: SUMMARY_TEMPLATE)
+      end
+
+    IO.write(SUMMARY_BACKUP, summary)
+
+    summary
+  end
+
+  def default_to_manual_selection(options, *params)
+    params.each do |param|
+      options[param] ||= Shared::Selection::MANUAL_LIST_SELECTION_FLAG
+    end
+
+    options
+  end
+
+  def protected_repositories
+    configuration = SimpleScripting::Configuration.load
+
+    configuration.protected_repositories.to_s.split(':')
+  end
+end
+
+GeetLauncher.new.launch if $PROGRAM_NAME == __FILE__
